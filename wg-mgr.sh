@@ -4,6 +4,86 @@
 #
 # Copyright (c) 2020 Blackh00d. Released under the MIT License.
 
+# === Reverse Tunnel Prompt ===
+ask_reverse_tunnel_mode() {
+    echo
+    echo "Will this WireGuard server use a reverse tunnel via a VPS?"
+    read -p "Use reverse tunnel? [y/N]: " use_reverse_tunnel
+    use_reverse_tunnel="${use_reverse_tunnel,,}"  # Lowercase
+    if [[ "$use_reverse_tunnel" == "y" ]]; then
+        reverse_tunnel_enabled="yes"
+        read -p "Enter your VPS IP [93.188.161.70]: " vps_ip
+        vps_ip="${vps_ip:-93.188.161.70}"
+        read -p "Enter your VPS username [brucepi]: " vps_user
+        vps_user="${vps_user:-brucepi}"
+        reverse_vps_ip="$vps_ip"
+        reverse_vps_user="$vps_user"
+    else
+        reverse_tunnel_enabled="no"
+    fi
+}
+
+# === Reverse Tunnel Service Setup ===
+setup_reverse_tunnel_service() {
+    echo
+    echo "Setting up reverse SSH tunnel to VPS..."
+
+    ssh_key_path="/home/$SUDO_USER/.ssh/vps-tunnel-key"
+    ssh_pub="$ssh_key_path.pub"
+
+    # Check if autossh is installed
+    if ! command -v autossh &>/dev/null; then
+        echo "Installing autossh..."
+        if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
+            apt-get update && apt-get install -y autossh
+        elif [[ "$os" == "centos" || "$os" == "fedora" ]]; then
+            dnf install -y autossh
+        fi
+    fi
+
+    # Generate SSH key if not present
+    if [[ ! -f "$ssh_key_path" ]]; then
+        echo "Generating SSH key for autossh..."
+        sudo -u "$SUDO_USER" ssh-keygen -t ed25519 -f "$ssh_key_path" -N ""
+    fi
+
+    # Copy public key to VPS if not already present
+    if ! sudo -u "$SUDO_USER" ssh -o BatchMode=yes -i "$ssh_key_path" "${reverse_vps_user}@${reverse_vps_ip}" true 2>/dev/null; then
+        echo "Copying public key to VPS..."
+        sudo -u "$SUDO_USER" ssh-copy-id -i "$ssh_pub" "${reverse_vps_user}@${reverse_vps_ip}"
+    else
+        echo "SSH key already authorized on VPS."
+    fi
+
+    # Create systemd service if not already present
+    if [[ ! -f /etc/systemd/system/reverse-wg-tunnel.service ]]; then
+        echo "Creating systemd service..."
+        cat <<EOF | sudo tee /etc/systemd/system/reverse-wg-tunnel.service > /dev/null
+[Unit]
+Description=Reverse WireGuard Tunnel to VPS
+After=network-online.target
+Requires=network-online.target
+
+[Service]
+User=$SUDO_USER
+ExecStart=/usr/bin/autossh -M 0 -N \\
+ -i $ssh_key_path \\
+ -o "ServerAliveInterval 30" -o "ServerAliveCountMax 3" \\
+ -R 51820:localhost:51820 ${reverse_vps_user}@${reverse_vps_ip}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable --now reverse-wg-tunnel
+        echo "✅ Reverse tunnel service enabled."
+    else
+        echo "Reverse tunnel systemd service already exists."
+        systemctl enable --now reverse-wg-tunnel
+    fi
+}
+
 echo
 echo "Welcome to the Digital Nomad WireGuard Manager!"
 echo
@@ -105,16 +185,26 @@ main_menu() {
 	echo
 	echo "=== Digital Nomad WireGuard Manager ==="
 	echo "What would you like to do?"
+	echo "SETUP & CLIENTS:"
 	echo "   1) Set up a new WireGuard server"
 	echo "   2) Update a WireGuard server after relocation"
 	echo "   3) Create a WireGuard client configuration"
-	echo "   4) Remove an existing client"
+	echo
+	echo "REMOVAL & CLEANUP:"
+	echo "   4) Remove an existing client from a tunnel"
 	echo "   5) Remove a specific WireGuard tunnel"
-	echo "   6) Remove ALL WireGuard configurations"
-	echo "   7) Show WireGuard status"
-	echo "   8) Test WireGuard connectivity"
-	echo "   9) Clean up conflicting services"
-	echo "   10) Exit"
+	echo "   6) Remove ALL WireGuard tunnels/configs"
+	echo "   7) Clean up orphaned/conflicting services"
+	echo "   8) Completely uninstall and wipe all WireGuard-related files and packages"
+	echo
+	echo "STATUS & DIAGNOSTICS:"
+	echo "   9) Show WireGuard status"
+	echo "   10) Test WireGuard connectivity"
+	echo "   11) Diagnose routing issues"
+	echo "   12) Fix routing issues"
+	echo "   13) Debug WireGuard traffic"
+	echo
+	echo "   14) Exit"
 	read -p "Option [1]: " initial_option
 	initial_option=${initial_option:-1} # Default to 1 if nothing is entered
 
@@ -130,27 +220,44 @@ main_menu() {
 			;;
 		4)
 			remove_existing_client_from_server
+			main_menu
 			;;
 		5)
 			remove_specific_tunnel
 			main_menu
 			;;
 		6)
-			remove_wireguard_from_server
+			remove_all_wireguard_tunnels
+			main_menu
 			;;
 		7)
-			show_wireguard_status
-			main_menu
-			;;
-		8)
-			test_wireguard_connectivity
-			main_menu
-			;;
-		9)
 			cleanup_all_wireguard_services
 			main_menu
 			;;
+		8)
+			complete_wireguard_uninstall
+			;;
+		9)
+			show_wireguard_status
+			main_menu
+			;;
 		10)
+			test_wireguard_connectivity
+			main_menu
+			;;
+		11)
+			diagnose_routing
+			main_menu
+			;;
+		12)
+			fix_routing_issues
+			main_menu
+			;;
+		13)
+			debug_wireguard_traffic
+			main_menu
+			;;
+		14)
 			echo "Exiting."
 			exit 0
 			;;
@@ -291,6 +398,7 @@ remove_existing_client_from_server() {
 	if [[ "$number_of_clients" = 0 ]]; then
 		echo
 		echo "There are no existing clients in tunnel: $selected_tunnel"
+		main_menu
 		return
 	fi
 	echo
@@ -529,6 +637,8 @@ remove_wireguard_from_server() {
 	# Check if any WireGuard configurations exist
 	if ! ls /etc/wireguard/*.conf 2>/dev/null >/dev/null; then
 		echo "No WireGuard configurations found on this system."
+		echo "Nothing to remove."
+		main_menu
 		return
 	fi
 	
@@ -548,6 +658,7 @@ remove_wireguard_from_server() {
 	else
 		echo "WireGuard removal aborted!"
 	fi
+	main_menu
 }
 
 cleanup_specific_tunnel() {
@@ -634,12 +745,12 @@ remove_wireguard_completely() {
 	{ crontab -l 2>/dev/null | grep -v '/usr/local/sbin/boringtun-upgrade' ; } | crontab - 2>/dev/null
 	rm -f /usr/local/sbin/boringtun /usr/local/sbin/boringtun-upgrade
 	
-	# Remove WireGuard packages (optional - commented out to preserve for other uses)
-	# if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
-	#     apt-get remove --purge -y wireguard wireguard-tools
-	# elif [[ "$os" == "centos" || "$os" == "fedora" ]]; then
-	#     dnf remove -y wireguard-tools
-	# fi
+	# Remove WireGuard packages
+	if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
+	    apt-get remove --purge -y wireguard wireguard-tools
+	elif [[ "$os" == "centos" || "$os" == "fedora" ]]; then
+	    dnf remove -y wireguard-tools
+	fi
 	
 	# Remove client config files from home directory
 	rm -f ~/*.conf 2>/dev/null
@@ -776,6 +887,314 @@ test_wireguard_connectivity() {
 	echo "=== Test Complete ==="
 	echo "If issues persist, check the logs with:"
 	echo "  journalctl -u wg-quick@${selected_tunnel}.service"
+}
+
+fix_routing_issues() {
+	echo "=== Fixing WireGuard Routing Issues ==="
+	echo
+	
+	echo "1. Checking IP Forwarding..."
+	if [[ $(cat /proc/sys/net/ipv4/ip_forward) -eq 1 ]]; then
+		echo "   ✓ IPv4 forwarding is enabled"
+	else
+		echo "   ✗ IPv4 forwarding is DISABLED - Fixing..."
+		echo 1 > /proc/sys/net/ipv4/ip_forward
+		if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+			echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+		fi
+		echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wireguard-forward.conf
+		echo "   ✓ IP forwarding enabled and made persistent"
+	fi
+	
+	echo
+	echo "2. Detecting correct internet interface..."
+	
+	# Show all interfaces with their IPs
+	echo "   Available interfaces:"
+	ip link show | grep -E '^[0-9]+:' | while read line; do
+		iface=$(echo "$line" | awk -F': ' '{print $2}')
+		state=$(echo "$line" | grep -o 'state [A-Z]*' | cut -d' ' -f2)
+		ip_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep -oE 'inet [0-9.]+/' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+		echo "     $iface: $state${ip_addr:+ ($ip_addr)}"
+	done
+	
+	# Get the interface used for default route
+	auto_detected=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
+	auto_ip=$(ip -4 addr show dev "$auto_detected" 2>/dev/null | grep -oE 'inet [0-9.]+/' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+	
+	echo "   Auto-detected: $auto_detected ($auto_ip)"
+	
+	# Check if this looks like a ZeroTier or private network IP
+	if [[ "$auto_ip" =~ ^10\. ]] || [[ "$auto_ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] || [[ "$auto_ip" =~ ^192\.168\. ]]; then
+		echo "   WARNING: Auto-detected interface has private IP ($auto_ip)"
+		echo "   This may be a ZeroTier or private network interface."
+		echo "   For internet access, you need the interface that connects to your ISP/router."
+	fi
+	
+	echo
+	read -p "   Enter the interface name for INTERNET access [$auto_detected]: " default_iface
+	default_iface="${default_iface:-$auto_detected}"
+	
+	# Check if interface has IP
+	iface_ip=$(ip -4 addr show dev "$default_iface" 2>/dev/null | grep -oE 'inet [0-9.]+/' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+	if [[ -n "$iface_ip" ]]; then
+		echo "   Using interface: $default_iface ($iface_ip)"
+	else
+		echo "   ✗ Interface $default_iface has no IP address!"
+		return 1
+	fi
+	
+	echo
+	echo "3. Cleaning up existing NAT rules..."
+	# Remove any existing WireGuard MASQUERADE rules
+	iptables -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE 2>/dev/null || true
+	iptables -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -o "$default_iface" -j MASQUERADE 2>/dev/null || true
+	
+	# Remove any broad MASQUERADE rules on the interface
+	while iptables -t nat -D POSTROUTING -o "$default_iface" -j MASQUERADE 2>/dev/null; do
+		echo "   Removed broad MASQUERADE rule"
+	done
+	
+	echo
+	echo "4. Fixing FORWARD chain policy..."
+	# Check and fix FORWARD chain policy
+	forward_policy=$(iptables -L FORWARD | head -n1 | grep -o "policy [A-Z]*" | cut -d' ' -f2)
+	echo "   Current FORWARD policy: $forward_policy"
+	
+	if [[ "$forward_policy" == "DROP" ]]; then
+		echo "   ⚠ FORWARD policy is DROP - this blocks forwarded traffic!"
+		echo "   Setting FORWARD policy to ACCEPT..."
+		iptables -P FORWARD ACCEPT
+		echo "   ✓ FORWARD policy changed to ACCEPT"
+	fi
+	
+	echo
+	echo "5. Clearing existing FORWARD rules and adding correct ones..."
+	# Remove existing FORWARD rules that might conflict
+	iptables -D FORWARD -s 10.7.0.0/24 -j ACCEPT 2>/dev/null || true
+	iptables -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+	iptables -D FORWARD -j REJECT --reject-with icmp-host-prohibited 2>/dev/null || true
+	iptables -D FORWARD -j DROP 2>/dev/null || true
+	
+	# Add the correct FORWARD rules
+	iptables -A FORWARD -i wg+ -j ACCEPT
+	iptables -A FORWARD -o wg+ -j ACCEPT
+	iptables -A FORWARD -s 10.7.0.0/24 -j ACCEPT
+	iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+	echo "   ✓ Added WireGuard FORWARD rules"
+	
+	echo
+	echo "6. Adding correct NAT rule..."
+	iptables -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -o "$default_iface" -j MASQUERADE
+	echo "   ✓ Added rule: POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -o $default_iface -j MASQUERADE"
+	
+	echo
+	echo "7. Making iptables rules persistent..."
+	if command -v iptables-save >/dev/null; then
+		mkdir -p /etc/iptables
+		iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+		echo "   ✓ Saved iptables rules"
+	fi
+	
+	echo
+	echo "8. Current NAT Rules:"
+	iptables -t nat -L POSTROUTING -n -v | head -n5
+	
+	echo
+	echo "9. Current FORWARD Rules:"
+	iptables -L FORWARD -n -v | head -n10
+	
+	echo
+	echo "10. Testing Pi's internet connectivity..."
+	if ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
+		echo "   ✓ Pi can reach internet"
+	else
+		echo "   ✗ Pi cannot reach internet - check your network connection"
+	fi
+	
+	echo
+	echo "=== Fix Complete ==="
+	echo "The most common issue is FORWARD policy being DROP."
+	echo "If still not working, your router might be blocking forwarded traffic."
+	echo "Check your router settings for 'AP Isolation' or similar features."
+}
+
+diagnose_routing() {
+	echo "=== WireGuard Routing Diagnostics ==="
+	echo
+	echo "1. IP Forwarding Status:"
+	if [[ $(cat /proc/sys/net/ipv4/ip_forward) -eq 1 ]]; then
+		echo "   ✓ IPv4 forwarding is enabled"
+	else
+		echo "   ✗ IPv4 forwarding is DISABLED"
+	fi
+	
+	echo
+	echo "2. Network Interfaces:"
+	ip link show | grep -E '^[0-9]+:' | while read line; do
+		iface=$(echo "$line" | awk -F': ' '{print $2}')
+		state=$(echo "$line" | grep -o 'state [A-Z]*' | cut -d' ' -f2)
+		ip_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep -oE 'inet [0-9.]+/' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+		echo "   $iface: $state${ip_addr:+ ($ip_addr)}"
+	done
+	
+	echo
+	echo "3. Default Route:"
+	default_route=$(ip route show default | head -n1)
+	echo "   $default_route"
+	
+	echo
+	echo "4. NAT/MASQUERADE Rules:"
+	iptables -t nat -L POSTROUTING -n -v
+	
+	echo
+	echo "5. WireGuard Interface Status:"
+	if command -v wg >/dev/null; then
+		echo "   WireGuard interfaces:"
+		wg show
+		echo
+		echo "   WireGuard interface IP addresses:"
+		ip addr show | grep -A2 -B1 "wg"
+		echo
+		echo "   WireGuard routes:"
+		ip route show | grep "10.7.0"
+	else
+		echo "   WireGuard tools not installed"
+	fi
+	
+	echo
+	echo "6. Critical WireGuard Checks:"
+	
+	# Check if WireGuard interface exists and has correct IP
+	wg_iface=$(ip link show | grep -o "wg[^:]*" | head -n1)
+	if [[ -n "$wg_iface" ]]; then
+		echo "   ✓ WireGuard interface found: $wg_iface"
+		wg_ip=$(ip addr show "$wg_iface" | grep -o "inet [0-9.]*" | cut -d' ' -f2)
+		if [[ "$wg_ip" == "10.7.0.1" ]]; then
+			echo "   ✓ WireGuard interface has correct IP: $wg_ip"
+		else
+			echo "   ✗ WireGuard interface has wrong IP: $wg_ip (should be 10.7.0.1)"
+		fi
+		
+		# Check if interface is UP
+		if ip link show "$wg_iface" | grep -q "state UP"; then
+			echo "   ✓ WireGuard interface is UP"
+		else
+			echo "   ✗ WireGuard interface is DOWN"
+		fi
+	else
+		echo "   ✗ No WireGuard interface found"
+	fi
+	
+	# Check WireGuard service
+	wg_service=$(systemctl list-units --type=service | grep "wg-quick@" | awk '{print $1}' | head -n1)
+	if [[ -n "$wg_service" ]]; then
+		if systemctl is-active --quiet "$wg_service"; then
+			echo "   ✓ WireGuard service is active: $wg_service"
+		else
+			echo "   ✗ WireGuard service is not active: $wg_service"
+		fi
+	else
+		echo "   ✗ No WireGuard service found"
+	fi
+	
+	echo
+	echo "=== Diagnostics Complete ==="
+	echo "If WireGuard interface issues found, restart the service:"
+	echo "  systemctl restart wg-quick@[tunnel-name]"
+}
+
+debug_wireguard_traffic() {
+	echo "=== WireGuard Traffic Debug ==="
+	echo
+	echo "This will check if WireGuard traffic is actually reaching the Pi."
+	echo
+	
+	# Check if WireGuard is running
+	if ! command -v wg >/dev/null; then
+		echo "WireGuard tools not installed!"
+		return 1
+	fi
+	
+	# Show current WireGuard status
+	echo "1. Current WireGuard Status:"
+	wg show
+	
+	echo
+	echo "2. WireGuard Interface Status:"
+	for iface in $(wg show interfaces 2>/dev/null); do
+		echo "   Interface: $iface"
+		ip addr show "$iface" 2>/dev/null | grep "inet " || echo "   No IP assigned!"
+	done
+	
+	echo
+	echo "3. Routing Table for WireGuard:"
+	ip route show | grep -E "(10\.7\.0|wg)" || echo "   No WireGuard routes found!"
+	
+	echo
+	echo "4. Key iptables rules:"
+	echo "   FORWARD policy: $(iptables -L FORWARD | head -n1 | grep -o "policy [A-Z]*")"
+	echo "   NAT rules for 10.7.0.0/24:"
+	iptables -t nat -L POSTROUTING -n | grep "10\.7\.0" || echo "   No NAT rules found!"
+	echo "   FORWARD rules for 10.7.0.0/24:"
+	iptables -L FORWARD -n | grep "10\.7\.0" || echo "   No FORWARD rules found!"
+	
+	echo
+	echo "5. UDP Port Status:"
+	wg_port=$(grep ListenPort /etc/wireguard/*.conf 2>/dev/null | cut -d " " -f 3 | head -n1)
+	if [[ -n "$wg_port" ]]; then
+		echo "   WireGuard port: $wg_port"
+		if netstat -ulpn | grep ":$wg_port " >/dev/null; then
+			echo "   ✓ Port $wg_port is listening"
+		else
+			echo "   ✗ Port $wg_port is NOT listening!"
+		fi
+	else
+		echo "   Could not detect WireGuard port"
+	fi
+	
+	echo
+	echo "6. Testing Pi connectivity:"
+	echo "   Pi can reach internet: $(ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 && echo "YES" || echo "NO")"
+	
+	echo
+	echo "=== CRITICAL CHECKS ==="
+	
+	# Check if WireGuard interface exists and has correct IP
+	wg_iface=$(wg show interfaces | head -n1)
+	if [[ -n "$wg_iface" ]]; then
+		wg_ip=$(ip addr show "$wg_iface" | grep "inet " | awk '{print $2}')
+		if [[ "$wg_ip" == "10.7.0.1/24" ]]; then
+			echo "✓ WireGuard interface $wg_iface has correct IP: $wg_ip"
+		else
+			echo "✗ WireGuard interface $wg_iface has wrong IP: $wg_ip (should be 10.7.0.1/24)"
+		fi
+	else
+		echo "✗ No WireGuard interface found - service may not be running!"
+	fi
+	
+	# Check for active peers
+	peer_count=$(wg show 2>/dev/null | grep -c "peer:" || echo "0")
+	echo "Connected peers: $peer_count"
+	
+	if [[ "$peer_count" -eq 0 ]]; then
+		echo "✗ No peers connected - client connection failing"
+		echo
+		echo "TROUBLESHOOTING STEPS:"
+		echo "1. Check client config endpoint matches this Pi's IP"
+		echo "2. Check firewall isn't blocking port $wg_port"
+		echo "3. Restart WireGuard service: systemctl restart wg-quick@*"
+	else
+		echo "✓ Peers are connected"
+		echo
+		echo "Since peers connect but can't route traffic, check:"
+		echo "1. FORWARD policy (should be ACCEPT, not DROP)"
+		echo "2. Missing FORWARD rules for WireGuard traffic"
+		echo "3. Try running option 11 (Fix routing issues)"
+	fi
+	
+	echo
+	echo "=== Debug Complete ==="
 }
 
 cleanup_all_wireguard_services() {
@@ -1110,9 +1529,27 @@ configure_routing_and_traffic() {
 	
 	echo "Using interface '$primary_interface' for NAT masquerading"
 	
+	# Verify the interface exists and has connectivity
+	if ! ip link show "$primary_interface" &>/dev/null; then
+		echo "ERROR: Interface '$primary_interface' does not exist!"
+		echo "Available interfaces:"
+		ip link show | grep -E '^[0-9]+:' | awk -F': ' '{print "  " $2}'
+		exit 1
+	fi
+	
+	# Check if interface has an IP address
+	primary_ip=$(ip -4 addr show dev "$primary_interface" | grep -oE 'inet [0-9.]+/' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+	if [[ -z "$primary_ip" ]]; then
+		echo "WARNING: Interface '$primary_interface' has no IPv4 address!"
+		echo "This may cause routing issues."
+	else
+		echo "Interface '$primary_interface' has IP: $primary_ip"
+	fi
+	
 	# Configure iptables for NAT masquerading
 	echo "Setting up iptables NAT masquerading..."
-	sudo iptables -t nat -A POSTROUTING -o "$primary_interface" -j MASQUERADE
+	echo "Rule: iptables -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -o $primary_interface -j MASQUERADE"
+	sudo iptables -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -o "$primary_interface" -j MASQUERADE
 	
 	# Install iptables-persistent to save rules
 	echo "Installing iptables-persistent to save firewall rules..."
@@ -1164,12 +1601,12 @@ new_client_dns () {
 	echo "   4) OpenDNS"
 	echo "   5) Quad9"
 	echo "   6) AdGuard"
+	echo "   7) Specify custom resolvers"
 	read -p "DNS server [1]: " dns
-	until [[ -z "$dns" || "$dns" =~ ^[1-6]$ ]]; do
+	until [[ -z "$dns" || "$dns" =~ ^[1-7]$ ]]; do
 		echo "$dns: invalid selection."
 		read -p "DNS server [1]: " dns
 	done
-		# DNS
 	case "$dns" in
 		1|"")
 			# Locate the proper resolv.conf
@@ -1196,6 +1633,29 @@ new_client_dns () {
 		;;
 		6)
 			dns="94.140.14.14, 94.140.15.15"
+		;;
+		7)
+			echo
+			custom_dns=""
+			until [[ -n "$custom_dns" ]]; do
+				echo "Enter DNS servers (one or more IPv4 addresses, separated by commas or spaces):"
+				read -p "DNS servers: " dns_input
+				dns_input=$(echo "$dns_input" | tr ',' ' ')
+				for dns_ip in $dns_input; do
+					if [[ "$dns_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+						if [[ -z "$custom_dns" ]]; then
+							custom_dns="$dns_ip"
+						else
+							custom_dns="$custom_dns, $dns_ip"
+						fi
+					fi
+				done
+				if [ -z "$custom_dns" ]; then
+					echo "Invalid input."
+				else
+					dns="$custom_dns"
+				fi
+			done
 		;;
 	esac
 }
@@ -1249,17 +1709,27 @@ EOF
 main_server_setup() {
 	# Check for and clean up orphaned services first
 	auto_cleanup_orphaned_services
-	
+
+	# === Reverse Tunnel Prompt and Setup ===
+	ask_reverse_tunnel_mode
+	if [[ "$reverse_tunnel_enabled" == "yes" ]]; then
+		setup_reverse_tunnel_service
+	fi
+
 	echo
 	echo "Enter a name for this WireGuard tunnel (used for config file and service name):"
 	read -p "Tunnel name [wg-server]: " tunnel_name
 	tunnel_name=${tunnel_name:-wg-server}
-	
+
 	# Sanitize tunnel name to ensure it's safe for filesystem and systemd
 	tunnel_name=$(echo "$tunnel_name" | sed 's/[^a-zA-Z0-9_-]/-/g' | cut -c-32)
+
+	# Ensure /etc/wireguard directory exists
+	mkdir -p /etc/wireguard
+
 	wg_conf_file="/etc/wireguard/${tunnel_name}.conf"
 	wg_iface="$tunnel_name"
-	
+
 	# Check if this tunnel name already exists
 	if [[ -e "$wg_conf_file" ]]; then
 		echo
@@ -1270,7 +1740,7 @@ main_server_setup() {
 		echo "   3) Cancel setup"
 		read -p "Option [1]: " name_conflict_option
 		name_conflict_option=${name_conflict_option:-1}
-		
+
 		case "$name_conflict_option" in
 			1)
 				main_server_setup
@@ -1290,12 +1760,13 @@ main_server_setup() {
 				;;
 		esac
 	fi
-	
+
 	echo "Setting up WireGuard tunnel: $tunnel_name"
 	echo "Configuration file: $wg_conf_file"
 	echo
-	
-	read -p "Will you be using ZeroTier for this WireGuard server's endpoint? [y/N]: " use_zerotier_input
+
+	# Only prompt for ZeroTier network ID for backup, not for endpoint
+	read -p "Will you enable ZeroTier as a backup connection to this device? [y/N]: " use_zerotier_input
 	use_zerotier_input=$(echo "$use_zerotier_input" | tr '[:upper:]' '[:lower:]') # Convert to lowercase
 
 	if [[ "$use_zerotier_input" == "y" ]]; then
@@ -1333,8 +1804,29 @@ main_server_setup() {
 		else
 			echo "ZeroTier appears to be already installed."
 		fi
-	fi
 
+		echo
+		echo "Please enter your ZeroTier Network ID to join (for backup access):"
+		read -p "ZeroTier Network ID: " zt_network_id
+		until [[ -n "$zt_network_id" ]]; do
+			echo "Network ID cannot be empty."
+			read -p "ZeroTier Network ID: " zt_network_id
+		done
+
+		echo "Attempting to join ZeroTier network $zt_network_id..."
+		if sudo zerotier-cli join "$zt_network_id"; then
+			echo "Successfully sent join request to network $zt_network_id."
+			echo "IMPORTANT: Please go to your ZeroTier Central (my.zerotier.com)"
+			echo "and authorize this new device on the network."
+			echo
+			read -p "Press Enter once the device is authorized on the ZeroTier network..."
+		else
+			echo "Failed to join ZeroTier network $zt_network_id."
+			echo "Please check the Network ID and your ZeroTier configuration."
+			exit 1
+		fi
+		echo
+	fi
 
 	# Detect some Debian minimal setups where neither wget nor curl are installed
 	if ! hash wget 2>/dev/null && ! hash curl 2>/dev/null; then
@@ -1706,69 +2198,213 @@ EOF
 			ip6tables_path=$(command -v ip6tables-legacy)
 		fi
 		
-		echo "[Unit]
+		# Use fallback IP detection if needed
+		if [[ -z "$ip" ]]; then
+			ip=$(get_ip)
+			if [[ -z "$ip" ]]; then
+				echo "Warning: Could not detect IP address. Using primary interface IP..."
+				ip=$(ip -4 addr | grep inet | grep -vE '127(\.[0-9]{1,3}){3}' | cut -d '/' -f 1 | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
+			fi
+		fi
+		
+		echo "Creating iptables service for WireGuard..."
+		cat > /etc/systemd/system/wg-iptables.service << EOF
+[Unit]
 Before=network.target
 [Service]
 Type=oneshot
-ExecStart=$iptables_path -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip || true" > /etc/systemd/system/wg-iptables.service
+ExecStart=$iptables_path -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip
+EOF
 
 		if [[ "$use_zerotier" == "y" ]]; then
-			physical_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
+			# Use the confirmed physical interface for ZeroTier setups
+			physical_iface="${physical_iface_confirmed:-$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)}"
 			if [[ -z "$physical_iface" ]]; then
-				echo "Could not detect the physical interface for outbound NAT. Please check your routing."
-				exit 1
+				echo "Warning: Could not detect physical interface, using default route interface..."
+				physical_iface=$(ip route | grep default | awk '{print $5}' | head -n1)
+				if [[ -z "$physical_iface" ]]; then
+					echo "Warning: Still no interface found, using eth0 as fallback"
+					physical_iface="eth0"
+				fi
 			fi
-			echo "ExecStart=$iptables_path -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE || true
-ExecStart=$iptables_path -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -o $physical_iface -j MASQUERADE || true
-ExecStart=$iptables_path -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -o $physical_iface -j MASQUERADE" >> /etc/systemd/system/wg-iptables.service
+			echo "Using physical interface: $physical_iface for MASQUERADE"
+			cat >> /etc/systemd/system/wg-iptables.service << EOF
+ExecStart=$iptables_path -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
+ExecStart=$iptables_path -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -o $physical_iface -j MASQUERADE
+ExecStart=$iptables_path -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -o $physical_iface -j MASQUERADE
+EOF
 		else
-			echo "ExecStart=$iptables_path -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip" >> /etc/systemd/system/wg-iptables.service
+			cat >> /etc/systemd/system/wg-iptables.service << EOF
+ExecStart=$iptables_path -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip
+EOF
 		fi
 
-		echo "ExecStart=$iptables_path -I INPUT -p udp --dport $port -j ACCEPT
+		cat >> /etc/systemd/system/wg-iptables.service << EOF
+ExecStart=$iptables_path -I INPUT -p udp --dport $port -j ACCEPT
 ExecStart=$iptables_path -I FORWARD -s 10.7.0.0/24 -j ACCEPT
 ExecStart=$iptables_path -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+ExecStart=$iptables_path -A FORWARD -i wg+ -j ACCEPT
+ExecStart=$iptables_path -A FORWARD -o wg+ -j ACCEPT
+ExecStart=$iptables_path -A FORWARD -i wg-server -o $physical_iface -j ACCEPT
+ExecStart=$iptables_path -A FORWARD -i $physical_iface -o wg-server -m state --state RELATED,ESTABLISHED -j ACCEPT
 ExecStop=$iptables_path -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip
 ExecStop=$iptables_path -D INPUT -p udp --dport $port -j ACCEPT
 ExecStop=$iptables_path -D FORWARD -s 10.7.0.0/24 -j ACCEPT
-ExecStop=$iptables_path -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/wg-iptables.service
+ExecStop=$iptables_path -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+ExecStop=$iptables_path -D FORWARD -i wg+ -j ACCEPT
+ExecStop=$iptables_path -D FORWARD -o wg+ -j ACCEPT
+ExecStop=$iptables_path -D FORWARD -i wg-server -o $physical_iface -j ACCEPT
+ExecStop=$iptables_path -D FORWARD -i $physical_iface -o wg-server -m state --state RELATED,ESTABLISHED -j ACCEPT
+EOF
 
 		if [[ -n "$ip6" ]]; then
-			echo "ExecStart=$ip6tables_path -t nat -A POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
+			cat >> /etc/systemd/system/wg-iptables.service << EOF
+ExecStart=$ip6tables_path -t nat -A POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
 ExecStart=$ip6tables_path -I FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT
 ExecStart=$ip6tables_path -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$ip6tables_path -t nat -D POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
-ExecStop=$ip6tables_path -D FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT
-ExecStop=$ip6tables_path -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/wg-iptables.service
+ExecStop=$ip6tables_path -t nat -D POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6 || true
+ExecStop=$ip6tables_path -D FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT || true
+ExecStop=$ip6tables_path -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT || true
+EOF
 		fi
 
-		echo "RemainAfterExit=yes
+		cat >> /etc/systemd/system/wg-iptables.service << EOF
+RemainAfterExit=yes
 [Install]
-WantedBy=multi-user.target" >> /etc/systemd/system/wg-iptables.service
-		systemctl enable --now wg-iptables.service
+WantedBy=multi-user.target
+EOF
+
+		# Reload systemd and enable the service
+		systemctl daemon-reload
+		
+		echo "Enabling and starting iptables service..."
+		if systemctl enable wg-iptables.service; then
+			echo "✓ iptables service enabled"
+			if systemctl start wg-iptables.service; then
+				echo "✓ iptables service started successfully"
+			else
+				echo "⚠ Warning: iptables service failed to start"
+				echo "Check logs with: journalctl -u wg-iptables.service"
+				echo "You may need to configure firewall rules manually"
+			fi
+		else
+			echo "⚠ Warning: Failed to enable iptables service"
+		fi
 	fi
 
 	# Generate the first client configuration
 	new_client_setup
 
 	# Enable and start the wg-quick service
-	echo "Starting WireGuard tunnel: $tunnel_name"
-	systemctl enable wg-quick@${tunnel_name}.service
-	if systemctl start wg-quick@${tunnel_name}.service; then
-		echo "✓ WireGuard tunnel '$tunnel_name' started successfully"
+	echo "Configuring WireGuard service: $tunnel_name"
+	
+	# First check if WireGuard tools are properly installed
+	if ! command -v wg-quick &>/dev/null; then
+		echo "✗ ERROR: wg-quick command not found!"
+		echo "WireGuard tools are not properly installed."
+		echo "Attempting to reinstall WireGuard tools..."
 		
-		# Verify the service is running
-		sleep 2
-		if systemctl is-active --quiet wg-quick@${tunnel_name}.service; then
-			echo "✓ Service is running properly"
+		if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
+			apt-get update
+			apt-get install -y wireguard-tools
+		elif [[ "$os" == "centos" || "$os" == "fedora" ]]; then
+			dnf install -y wireguard-tools
+		fi
+		
+		# Check again after installation
+		if ! command -v wg-quick &>/dev/null; then
+			echo "✗ Failed to install WireGuard tools!"
+			echo "Please install wireguard-tools package manually and try again."
+			return 1
+		fi
+		echo "✓ WireGuard tools installed successfully"
+	fi
+	
+	# Check if the wg-quick@ service template exists, if not create it
+	if ! systemctl cat wg-quick@.service >/dev/null 2>&1; then
+		echo "⚠ Warning: wg-quick@.service template not found!"
+		echo "Creating WireGuard systemd service template..."
+		
+		# Create the wg-quick@ service template manually
+		cat > /lib/systemd/system/wg-quick@.service << 'EOF'
+[Unit]
+Description=WireGuard via wg-quick(8) for %I
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
+PartOf=wg-quick.target
+Documentation=man:wg-quick(8)
+Documentation=man:wg(8)
+Documentation=https://www.wireguard.com/
+Documentation=https://www.wireguard.com/quickstart/
+Documentation=https://git.zx2c4.com/wireguard-tools/about/src/man/wg-quick.8
+Documentation=https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/wg-quick up %i
+ExecStop=/usr/bin/wg-quick down %i
+Environment=WG_ENDPOINT_RESOLUTION_RETRIES=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+		
+		# Also create the target file
+		cat > /lib/systemd/system/wg-quick.target << 'EOF'
+[Unit]
+Description=WireGuard via wg-quick(8)
+Documentation=man:wg-quick(8)
+Documentation=man:wg(8)
+Documentation=https://www.wireguard.com/
+Documentation=https://www.wireguard.com/quickstart/
+Documentation=https://git.zx2c4.com/wireguard-tools/about/src/man/wg-quick.8
+Documentation=https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8
+EOF
+		
+		systemctl daemon-reload
+		
+		# Verify the template was created
+		if systemctl cat wg-quick@.service >/dev/null 2>&1; then
+			echo "✓ WireGuard systemd service template created successfully"
 		else
-			echo "⚠ Warning: Service may not be running properly"
-			echo "Check status with: systemctl status wg-quick@${tunnel_name}.service"
+			echo "✗ Failed to create WireGuard systemd service template"
+			echo "Continuing with manual service management..."
+		fi
+	fi
+	
+	echo "Enabling WireGuard service..."
+	if systemctl enable wg-quick@${tunnel_name}.service; then
+		echo "✓ WireGuard service enabled successfully"
+		
+		echo "Starting WireGuard tunnel: $tunnel_name"
+		if systemctl start wg-quick@${tunnel_name}.service; then
+			echo "✓ WireGuard tunnel '$tunnel_name' started successfully"
+			
+			# Verify the service is running
+			sleep 2
+			if systemctl is-active --quiet wg-quick@${tunnel_name}.service; then
+				echo "✓ Service is running properly"
+				
+				# Show interface status
+				if command -v wg &>/dev/null && wg show "$tunnel_name" &>/dev/null; then
+					echo "✓ WireGuard interface is active"
+				fi
+			else
+				echo "⚠ Warning: Service may not be running properly"
+				echo "Check status with: systemctl status wg-quick@${tunnel_name}.service"
+			fi
+		else
+			echo "✗ Failed to start WireGuard tunnel '$tunnel_name'"
+			echo "Check the logs with: journalctl -u wg-quick@${tunnel_name}.service"
+			echo "Try manual start with: wg-quick up $tunnel_name"
+			return 1
 		fi
 	else
-		echo "✗ Failed to start WireGuard tunnel '$tunnel_name'"
-		echo "Check the logs with: journalctl -u wg-quick@${tunnel_name}.service"
-		echo "Check the configuration with: wg-quick up $tunnel_name"
+		echo "✗ Failed to enable WireGuard service"
+		echo "This usually indicates a problem with the WireGuard installation."
+		echo "Try: systemctl daemon-reload && systemctl enable wg-quick@${tunnel_name}.service"
+		return 1
 	fi
 
 	# Set up automatic updates for BoringTun if requested
@@ -1828,6 +2464,50 @@ while [[ -e "/etc/wireguard/wg${wg_iface_num}.conf" ]]; do
 done
 wg_iface="wg${wg_iface_num}"
 wg_conf_file="/etc/wireguard/${wg_iface}.conf"
+
+# Remove ALL WireGuard configurations and uninstall everything (option 8)
+complete_wireguard_uninstall() {
+	echo
+	echo "This will COMPLETELY UNINSTALL WireGuard, remove all tunnels, configs, keys, and packages."
+	echo "This is IRREVERSIBLE. Are you sure?"
+	read -p "Type 'WIPE' to confirm: " confirm
+	if [[ "$confirm" != "WIPE" ]]; then
+		echo "Aborted."
+		main_menu
+		return
+	fi
+
+	echo "Stopping all WireGuard services..."
+	systemctl stop wg-quick@* 2>/dev/null
+	systemctl disable wg-quick@* 2>/dev/null
+	systemctl stop wg-iptables.service 2>/dev/null
+	systemctl disable wg-iptables.service 2>/dev/null
+
+	echo "Removing all WireGuard configs and keys..."
+	rm -rf /etc/wireguard/
+	rm -f /etc/systemd/system/wg-iptables.service
+	rm -rf /etc/systemd/system/wg-quick@*.service.d/
+	rm -f /etc/systemd/system/wg-quick@*.service
+	rm -f /lib/systemd/system/wg-quick@*.service
+	rm -f /run/systemd/system/wg-quick@*.service
+	rm -f /etc/sysctl.d/99-wireguard-forward.conf
+	rm -f ~/*.conf ~/*_qr.txt 2>/dev/null
+
+	echo "Removing WireGuard packages..."
+	if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
+		apt-get remove --purge -y wireguard wireguard-tools autossh
+	elif [[ "$os" == "centos" || "$os" == "fedora" ]]; then
+		dnf remove -y wireguard-tools autossh
+	fi
+
+	echo "Reloading systemd..."
+	systemctl daemon-reload
+	systemctl reset-failed 2>/dev/null
+
+	echo "WireGuard and all related files/packages have been completely removed."
+	echo "Returning to main menu."
+	main_menu
+}
 
 # Always show the main menu - the individual functions will check if WireGuard is installed
 main_menu

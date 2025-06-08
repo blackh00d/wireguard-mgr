@@ -1,0 +1,109 @@
+## ✅ PATCH: Add Reverse Tunnel Prompt to `main_server_setup()`
+
+### ✂️ 1. Insert this function into your script (top-level, after other function definitions)
+
+```bash
+ask_reverse_tunnel_mode() {
+    echo
+    echo "Will this WireGuard server use a reverse tunnel via a VPS?"
+    read -p "Use reverse tunnel? [y/N]: " use_reverse_tunnel
+    use_reverse_tunnel="${use_reverse_tunnel,,}"  # Lowercase
+    if [[ "$use_reverse_tunnel" == "y" ]]; then
+        reverse_tunnel_enabled="yes"
+        read -p "Enter your VPS IP [93.188.161.70]: " vps_ip
+        vps_ip="${vps_ip:-93.188.161.70}"
+        read -p "Enter your VPS username [brucepi]: " vps_user
+        vps_user="${vps_user:-brucepi}"
+        reverse_vps_ip="$vps_ip"
+        reverse_vps_user="$vps_user"
+    else
+        reverse_tunnel_enabled="no"
+    fi
+}
+```
+
+---
+
+### ✂️ 2. Insert this function that sets up the `autossh` systemd service
+
+```bash
+setup_reverse_tunnel_service() {
+    echo
+    echo "Setting up reverse SSH tunnel to VPS..."
+
+    ssh_key_path="/home/$SUDO_USER/.ssh/vps-tunnel-key"
+    ssh_pub="$ssh_key_path.pub"
+
+    if [[ ! -f "$ssh_key_path" ]]; then
+        echo "Generating SSH key for autossh..."
+        sudo -u "$SUDO_USER" ssh-keygen -t ed25519 -f "$ssh_key_path" -N ""
+    fi
+
+    echo "Copying public key to VPS..."
+    sudo -u "$SUDO_USER" ssh-copy-id -i "$ssh_pub" "${reverse_vps_user}@${reverse_vps_ip}"
+
+    echo "Creating systemd service..."
+    cat <<EOF | sudo tee /etc/systemd/system/reverse-wg-tunnel.service > /dev/null
+[Unit]
+Description=Reverse WireGuard Tunnel to VPS
+After=network-online.target
+Requires=network-online.target
+
+[Service]
+User=$SUDO_USER
+ExecStart=/usr/bin/autossh -M 0 -N \\
+ -i $ssh_key_path \\
+ -o "ServerAliveInterval 30" -o "ServerAliveCountMax 3" \\
+ -R 51820:localhost:51820 ${reverse_vps_user}@${reverse_vps_ip}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now reverse-wg-tunnel
+
+    echo "✅ Reverse tunnel service enabled."
+}
+```
+
+---
+
+### ✂️ 3. Modify `main_server_setup()` to call those functions
+
+Near the beginning of the function:
+
+```bash
+main_server_setup() {
+    ask_reverse_tunnel_mode
+    if [[ "$reverse_tunnel_enabled" == "yes" ]]; then
+        setup_reverse_tunnel_service
+    fi
+
+    echo
+    echo "Enter a name for this WireGuard tunnel..."
+    ...
+```
+
+---
+
+### ✂️ 4. Inject the reverse tunnel IP into WireGuard client generation
+
+If your script already stores the public endpoint as a variable like `server_endpoint`, then update the logic to use the VPS IP when reverse tunnel is active.
+
+Right before writing client configs in your script (e.g. in `new_client_setup()` or `add_new_client_to_existing_server()`), add:
+
+```bash
+if [[ "$reverse_tunnel_enabled" == "yes" ]]; then
+    server_endpoint="$reverse_vps_ip"
+fi
+```
+
+If `reverse_tunnel_enabled` is not in scope in `new_client_setup()`, you can export it globally:
+
+```bash
+export reverse_tunnel_enabled reverse_vps_ip reverse_vps_user
+```
+
+
