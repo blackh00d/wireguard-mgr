@@ -376,6 +376,10 @@ EOF
     # Add NAT rule for outbound internet interface
     add_iptables_rule "-t nat -A POSTROUTING -o $OUT_IF -j MASQUERADE"
 
+    # Ensure forwarding rules for client network between wg0 and outbound interface
+    add_iptables_rule "-A FORWARD -i $WG_INTERFACE -o $OUT_IF -s $CLIENT_NETWORK -j ACCEPT"
+    add_iptables_rule "-A FORWARD -i $OUT_IF -o $WG_INTERFACE -d $CLIENT_NETWORK -j ACCEPT"
+
     # Enable and start WireGuard service
     echo "Enabling and starting WireGuard service..."
     systemctl enable "wg-quick@$WG_INTERFACE"

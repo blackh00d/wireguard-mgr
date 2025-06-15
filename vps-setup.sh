@@ -350,7 +350,8 @@ EOF
     add_iptables_rule "-A INPUT -p udp --dport $WG_PORT -j ACCEPT"
 
     # Add VPS-specific NAT rules
-    add_iptables_rule "-t nat -A POSTROUTING -s $CLIENT_NETWORK -j MASQUERADE"
+    # REMOVE this NAT rule to prevent the VPS from masquerading client traffic.
+    # add_iptables_rule "-t nat -A POSTROUTING -s $CLIENT_NETWORK -j MASQUERADE"
 
     echo ""
     echo "=== VPS WIREGUARD SETUP COMPLETE ==="
