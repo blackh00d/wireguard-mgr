@@ -309,7 +309,15 @@ setup_wireguard() {
     VPS_PUBLIC_KEY=$(echo "$VPS_PRIVATE_KEY" | wg pubkey)
 
     # Get VPS public IP
-    VPS_PUBLIC_IP=$(curl -s ifconfig.me)
+    # Detect IPv4 public IP only
+    VPS_PUBLIC_IP=$(curl -4 -s ifconfig.me)
+    if [[ -z "$VPS_PUBLIC_IP" ]]; then
+        VPS_PUBLIC_IP=$(curl -4 -s ipinfo.io/ip)
+    fi
+    if [[ -z "$VPS_PUBLIC_IP" ]]; then
+        VPS_PUBLIC_IP=$(ip route get 8.8.8.8 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1)
+    fi
+    echo "Detected VPS public IPv4 address: $VPS_PUBLIC_IP"
 
     # Save VPS keys
     echo "Saving VPS keys..."
@@ -331,7 +339,7 @@ ListenPort = $WG_PORT
 # Pi Peer
 [Peer]
 PublicKey = PI_PUBLIC_KEY_PLACEHOLDER
-AllowedIPs = $PI_WG_IP/32, $CLIENT_NETWORK
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 
 # CLIENT_NETWORK: $CLIENT_NETWORK
