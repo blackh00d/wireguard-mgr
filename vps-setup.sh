@@ -332,14 +332,31 @@ EOF
     echo "Creating WireGuard configuration..."
     cat > "/etc/wireguard/${WG_INTERFACE}.conf" << EOF
 [Interface]
-PrivateKey = $VPS_PRIVATE_KEY
 Address = $VPS_WG_IP
+PrivateKey = $VPS_PRIVATE_KEY
 ListenPort = $WG_PORT
+Table = off # Prevents wg-quick from altering main routing table's default route
+
+# Policy routing for traffic FROM clients ($CLIENT_NETWORK) to go via Pi
+PostUp = ip rule add from $CLIENT_NETWORK lookup 101 prio 1000
+PostUp = ip route add default dev %i table 101
+
+# Direct routes for VPS to reach Pi's tunnel IP and client network (if VPS initiates)
+PostUp = ip route add $PI_WG_IP/32 dev %i
+PostUp = ip route add $CLIENT_NETWORK dev %i
+
+# Remove the problematic fwmark rule that wg-quick might add if AllowedIPs contains 0.0.0.0/0
+PostUp = ip rule del fwmark 0xca6c lookup 51820 || true
+
+PostDown = ip rule del from $CLIENT_NETWORK lookup 101 prio 1000 || true
+PostDown = ip route flush table 101 || true
+PostDown = ip route del $PI_WG_IP/32 dev %i || true
+PostDown = ip route del $CLIENT_NETWORK dev %i || true
 
 # Pi Peer
 [Peer]
 PublicKey = PI_PUBLIC_KEY_PLACEHOLDER
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = 0.0.0.0/0, ::/0 # Kernel uses this to know it CAN send any IP to Pi
 PersistentKeepalive = 25
 
 # CLIENT_NETWORK: $CLIENT_NETWORK
