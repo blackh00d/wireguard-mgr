@@ -375,8 +375,8 @@ EOF
     add_iptables_rule "-A INPUT -p udp --dport $WG_PORT -j ACCEPT"
 
     # Add VPS-specific NAT rules
-    # REMOVE this NAT rule to prevent the VPS from masquerading client traffic.
-    # add_iptables_rule "-t nat -A POSTROUTING -s $CLIENT_NETWORK -j MASQUERADE"
+    # This NAT rule is incorrect for a relay setup and should not be used.
+    # The Pi is responsible for masquerading client traffic.
 
     echo ""
     echo "=== VPS WIREGUARD SETUP COMPLETE ==="
